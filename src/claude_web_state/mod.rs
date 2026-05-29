@@ -21,6 +21,9 @@ use crate::{
 
 pub mod bootstrap;
 pub mod chat;
+pub mod session;
+pub mod sse_manager;
+pub mod stream_parser;
 mod transform;
 /// Placeholder
 pub static SUPER_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);

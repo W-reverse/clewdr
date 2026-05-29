@@ -11,7 +11,7 @@ use crate::{
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     services::cookie_actor::CookieActorHandle,
-    types::claude::CreateMessageParams,
+    types::claude::{ContentBlock, CreateMessageParams, Message, MessageContent},
     utils::{enabled, print_out_json},
 };
 
@@ -131,6 +131,21 @@ impl LLMProvider for ClaudeWebProvider {
             format_display
         );
         print_out_json(&params, "claude_web_client_req.json");
+
+        if let Some((tool_use_id, tool_result)) = should_resume_for_tool(&params.messages) {
+            info!("[TOOL] Resuming session for tool_use_id: {}", tool_use_id);
+            let stopwatch = Instant::now();
+            let response = state
+                .resume_after_tool_result(&tool_use_id, &tool_result)
+                .await?;
+            let elapsed = stopwatch.elapsed();
+            info!(
+                "[FIN] elapsed: {}s",
+                format!("{}", elapsed.as_secs_f32()).green()
+            );
+            return Ok(ClaudeProviderResponse { context, response });
+        }
+
         let stopwatch = Instant::now();
         let response = state.try_chat(params).await?;
         let elapsed = stopwatch.elapsed();
@@ -214,4 +229,70 @@ impl LLMProvider for ClaudeCodeProvider {
 
 pub fn build_providers(cookie_actor_handle: CookieActorHandle) -> ClaudeProviders {
     ClaudeProviders::new(cookie_actor_handle)
+}
+
+fn extract_tool_use_id_from_messages(messages: &[Message]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if let MessageContent::Blocks { content } = &msg.content {
+            for block in content.iter().rev() {
+                match block {
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        if tool_use_id.starts_with("toolu_")
+                            && !tool_use_id.is_empty()
+                        {
+                            return Some(tool_use_id.clone());
+                        }
+                    }
+                    ContentBlock::McpToolResult { tool_use_id, .. } => {
+                        if tool_use_id.starts_with("toolu_")
+                            && !tool_use_id.is_empty()
+                        {
+                            return Some(tool_use_id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+fn should_resume_for_tool(messages: &[Message]) -> Option<(String, String)> {
+    let tool_use_id = extract_tool_use_id_from_messages(messages)?;
+    let tool_result = extract_tool_result_content(messages)?;
+
+    for msg in messages.iter().rev() {
+        if let MessageContent::Blocks { content } = &msg.content {
+            for block in content.iter() {
+                if let ContentBlock::ToolUse { name, .. } = block {
+                    if name == "tool_search" {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    Some((tool_use_id, tool_result))
+}
+
+fn extract_tool_result_content(messages: &[Message]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if let MessageContent::Blocks { content } = &msg.content {
+            for block in content.iter().rev() {
+                match block {
+                    ContentBlock::ToolResult { content, .. }
+                    | ContentBlock::McpToolResult { content, .. } => {
+                        return match content {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            other => Some(other.to_string()),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
 }

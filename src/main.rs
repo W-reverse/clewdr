@@ -129,6 +129,9 @@ async fn main() -> Result<(), ClewdrError> {
         .await
         .with_default_setup()
         .build();
+
+    tokio::spawn(clewdr::claude_web_state::session::SessionManager::cleanup_loop());
+
     // serve the application
     Ok(axum::serve(listener, router)
         .with_graceful_shutdown(async {

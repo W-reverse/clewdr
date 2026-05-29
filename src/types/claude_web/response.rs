@@ -5,30 +5,32 @@ use axum::{
 };
 use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
+use snafu::ResultExt;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
+use tracing::debug;
 use url::Url;
-use wreq::Proxy;
+use wreq::{Method, Proxy};
 
 use crate::{
     claude_code_state::ClaudeCodeState,
-    claude_web_state::ClaudeWebState,
-    error::{CheckClaudeErr, ClewdrError},
+    claude_web_state::{
+        ClaudeWebState,
+        session::SessionManager,
+        sse_manager::RawEventStream,
+        stream_parser::StreamParser,
+    },
+    config::CLEWDR_CONFIG,
+    error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     types::claude::{
         ContentBlock, CountMessageTokensResponse, CreateMessageParams, CreateMessageResponse,
-        Message, Role,
+        Message, MessageStartContent, Role, StopReason, StreamEvent, Usage,
     },
     utils::print_out_text,
 };
 
-/// Merges server-sent events (SSE) from a stream into a single string
-/// Extracts and concatenates completion data from events
-///
-/// # Arguments
-/// * `stream` - Event stream to process
-///
-/// # Returns
-/// Combined completion text from all events
 pub async fn merge_sse(
     stream: EventStream<impl Stream<Item = Result<Bytes, wreq::Error>>>,
 ) -> Result<String, ClewdrError> {
@@ -50,128 +52,122 @@ impl<S> From<S> for Message
 where
     S: Into<String>,
 {
-    /// Converts a string into a Message with assistant role
-    ///
-    /// # Arguments
-    /// * `str` - The text content for the message
-    ///
-    /// # Returns
-    /// * `Message` - A message with assistant role and text content
     fn from(str: S) -> Self {
         Message::new_blocks(Role::Assistant, vec![ContentBlock::text(str.into())])
     }
 }
 
+fn is_valid_stream_content_block(block: &ContentBlock) -> bool {
+    !matches!(
+        block,
+        ContentBlock::ToolResult { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. }
+            | ContentBlock::ContainerUpload { .. }
+    )
+}
+
+fn filter_event(event: &StreamEvent) -> bool {
+    match event {
+        StreamEvent::ContentBlockStart { content_block, .. } => {
+            is_valid_stream_content_block(content_block)
+        }
+        StreamEvent::Error { .. } => false,
+        _ => true,
+    }
+}
+
+fn stream_event_to_sse(event: StreamEvent) -> Result<SseEvent, serde_json::Error> {
+    let (event_type, data) = match &event {
+        StreamEvent::MessageStart { .. } => ("message_start", serde_json::to_string(&event)?),
+        StreamEvent::ContentBlockStart { .. } => ("content_block_start", serde_json::to_string(&event)?),
+        StreamEvent::ContentBlockDelta { .. } => ("content_block_delta", serde_json::to_string(&event)?),
+        StreamEvent::ContentBlockStop { .. } => ("content_block_stop", serde_json::to_string(&event)?),
+        StreamEvent::MessageDelta { .. } => ("message_delta", serde_json::to_string(&event)?),
+        StreamEvent::MessageStop => ("message_stop", serde_json::to_string(&event)?),
+        StreamEvent::Ping => ("ping", serde_json::to_string(&event)?),
+        StreamEvent::Error { .. } => ("error", serde_json::to_string(&event)?),
+    };
+    Ok(SseEvent::default().event(event_type).data(data))
+}
+
+#[derive(Deserialize)]
+struct CompletionData {
+    completion: String,
+}
+
+fn spawn_stream_parser_task(
+    mut raw_stream: RawEventStream,
+    model: String,
+    usage: Usage,
+    event_tx: mpsc::UnboundedSender<StreamEvent>,
+) {
+    tokio::spawn(async move {
+        let mut parser = StreamParser::new(model, usage);
+        let _ = event_tx.send(parser.message_start());
+
+        while let Some(event_result) = raw_stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    tracing::debug!(
+                        "SSE event: type={}, data={}",
+                        event.event,
+                        &event.data[..event.data.len().min(200)]
+                    );
+                    if let Ok(data) = serde_json::from_str::<CompletionData>(&event.data) {
+                        if data.completion.is_empty() {
+                            continue;
+                        }
+                        let events = parser.feed_completion(&data.completion);
+                        for e in events {
+                            if event_tx.send(e).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        tracing::debug!("SSE data not JSON completion: {}", &event.data[..event.data.len().min(200)]);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("SSE stream error: {}", e);
+                    let _ = event_tx.send(StreamEvent::Error {
+                        error: crate::types::claude::StreamError {
+                            type_: "internal_error".to_string(),
+                            message: e.to_string(),
+                        },
+                    });
+                    return;
+                }
+            }
+        }
+
+        let final_events = parser.finish();
+        for event in final_events {
+            if event_tx.send(event).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 impl ClaudeWebState {
-    /// Converts the response from the Claude Web into Claude API or OpenAI API format
-    ///
-    /// This method transforms streams of bytes from Claude's web response into the appropriate
-    /// format based on the client's requested API format (Claude or OpenAI). It handles both
-    /// streaming and non-streaming responses, and manages caching for responses.
-    ///
-    /// # Arguments
-    /// * `input` - The response stream from the Claude Web API
-    ///
-    /// # Returns
-    /// * `axum::response::Response` - Transformed response in the requested format
-    pub async fn transform_response(
+    pub async fn transform_response_with_opts(
         &mut self,
         wreq_res: wreq::Response,
+        has_tools: bool,
     ) -> Result<axum::response::Response, ClewdrError> {
         if self.stream {
-            // Stream through while accumulating completion text; persist usage at end
-            let mut input_tokens = self.usage.input_tokens as u64;
-            let handle = self.cookie_actor_handle.clone();
-            let cookie = self.cookie.clone();
-            let enable_precise = crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens;
-            let last_params = self.last_params.clone();
-            let endpoint = self.endpoint.clone();
-            let proxy = self.proxy.clone();
-            let client = self.client.clone();
-            // try to get precise input tokens via Claude Code count_tokens if enabled
-            if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
-                && let Some(tokens) = self.try_code_count_tokens().await
-            {
-                input_tokens = tokens as u64;
+            if has_tools {
+                return self.transform_stream_with_tools(wreq_res).await;
             }
-
-            let stream = wreq_res
-                .bytes_stream()
-                .eventsource()
-                .map_err(axum::Error::new);
-            let stream = try_stream! {
-                let mut acc = String::new();
-                #[derive(serde::Deserialize)]
-                struct Data { completion: String }
-                futures::pin_mut!(stream);
-                while let Some(event) = stream.try_next().await? {
-                    if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
-                        acc.push_str(&d.completion);
-                    }
-                    let e = SseEvent::default().event(event.event).id(event.id);
-                    let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
-                    yield e.data(event.data);
-                }
-                // on end of stream, compute output tokens and persist totals
-                if !acc.is_empty() {
-                    // Prefer official count_tokens if enabled and possible; else estimate locally
-                    let mut out = None;
-                    if enable_precise
-                        && let Some(model) = last_params.as_ref().map(|p| p.model.clone())
-                    {
-                        out = count_code_output_tokens_for_text(
-                            cookie.clone(), endpoint.clone(), proxy.clone(), client.clone(),
-                            model, acc.clone(), handle.clone()
-                        ).await.map(|v| v as u64);
-                    }
-                    let out = out.unwrap_or_else(|| {
-                        let usage = crate::types::claude::Usage { input_tokens: input_tokens as u32, output_tokens: 0 };
-                        let resp = crate::types::claude::CreateMessageResponse::text(acc.clone(), Default::default(), usage);
-                        resp.count_tokens() as u64
-                    });
-                    if let Some(mut c) = cookie.clone() {
-                        let family = last_params
-                            .as_ref()
-                            .map(|p| p.model.as_str())
-                            .map(|m| {
-                                let m = m.to_ascii_lowercase();
-                                if m.contains("opus") {
-                                    crate::config::ModelFamily::Opus
-                                } else if m.contains("sonnet") {
-                                    crate::config::ModelFamily::Sonnet
-                                } else {
-                                    crate::config::ModelFamily::Other
-                                }
-                            })
-                            .unwrap_or(crate::config::ModelFamily::Other);
-                        c.add_and_bucket_usage(input_tokens, out, family);
-                        let _ = handle.return_cookie(c, None).await;
-                    }
-                } else if let Some(mut c) = cookie.clone() {
-                    // still persist input tokens to maintain parity
-                    let family = last_params
-                        .as_ref()
-                        .map(|p| p.model.as_str())
-                        .map(|m| {
-                            let m = m.to_ascii_lowercase();
-                            if m.contains("opus") {
-                                crate::config::ModelFamily::Opus
-                            } else if m.contains("sonnet") {
-                                crate::config::ModelFamily::Sonnet
-                            } else {
-                                crate::config::ModelFamily::Other
-                            }
-                        })
-                        .unwrap_or(crate::config::ModelFamily::Other);
-                    c.add_and_bucket_usage(input_tokens, 0, family);
-                    let _ = handle.return_cookie(c, None).await;
-                }
-            };
-            // normalize error type for axum SSE
-            let stream = stream.map_err(|e: axum::Error| -> BoxError { e.into() });
-            return Ok(Sse::new(stream)
-                .keep_alive(Default::default())
-                .into_response());
+            return self.transform_stream_simple(wreq_res).await;
         }
 
         let stream = wreq_res.bytes_stream();
@@ -181,8 +177,7 @@ impl ClaudeWebState {
         let mut response =
             CreateMessageResponse::text(text.clone(), Default::default(), self.usage.to_owned());
 
-        // Prefer official counting if enabled
-        let enable_precise = crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens;
+        let enable_precise = CLEWDR_CONFIG.load().enable_web_count_tokens;
         let mut usage = self.usage.to_owned();
         if enable_precise && let Some(inp) = self.try_code_count_tokens().await {
             usage.input_tokens = inp;
@@ -208,6 +203,308 @@ impl ClaudeWebState {
         self.persist_usage_totals(usage.input_tokens as u64, output_tokens as u64)
             .await;
         Ok(Json(response).into_response())
+    }
+
+    async fn transform_stream_simple(
+        &mut self,
+        wreq_res: wreq::Response,
+    ) -> Result<axum::response::Response, ClewdrError> {
+        let raw_stream = crate::claude_web_state::sse_manager::wrap_response_stream(wreq_res);
+
+        let stream = try_stream! {
+            let mut sse_stream = raw_stream;
+            while let Some(event_result) = sse_stream.next().await {
+                match event_result {
+                    Ok(event) => {
+                        if let Ok(parsed) = serde_json::from_str::<StreamEvent>(&event.data) {
+                            if filter_event(&parsed) {
+                                yield stream_event_to_sse(parsed)
+                                    .map_err(|e| axum::Error::new(e))?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("SSE stream error in simple: {}", e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let stream = stream.map_err(|e: axum::Error| -> BoxError { e.into() });
+        Ok(Sse::new(stream)
+            .keep_alive(Default::default())
+            .into_response())
+    }
+
+    async fn transform_stream_with_tools(
+        &mut self,
+        wreq_res: wreq::Response,
+    ) -> Result<axum::response::Response, ClewdrError> {
+        let raw_stream = crate::claude_web_state::sse_manager::wrap_response_stream(wreq_res);
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let shared_rx: crate::claude_web_state::session::SharedEventReceiver =
+            Arc::new(Mutex::new(event_rx));
+
+        tokio::spawn(async move {
+            let tx = event_tx;
+            let mut sse_stream = raw_stream;
+            while let Some(event_result) = sse_stream.next().await {
+                match event_result {
+                    Ok(event) => {
+                        if let Ok(parsed) = serde_json::from_str::<StreamEvent>(&event.data) {
+                            if filter_event(&parsed) {
+                                if tx.send(parsed).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("SSE stream error in tools: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let model = self
+            .last_params
+            .as_ref()
+            .map(|p| p.model.clone())
+            .unwrap_or_default();
+
+        let message_start = MessageStartContent {
+            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            type_: "message".to_string(),
+            role: Role::Assistant,
+            content: vec![],
+            model,
+            stop_reason: None,
+            stop_sequence: None,
+            usage: Some(self.usage.clone()),
+        };
+
+        let mut tool_use_ids = Vec::new();
+        let mut events_to_stream = Vec::new();
+        let mut reached_tool_use = false;
+        let mut last_block_was_tool_use = false;
+        let mut active_tool_use_block_index: Option<usize> = None;
+        let tool_use_timeout = std::time::Duration::from_millis(1000);
+
+        loop {
+            let event = tokio::time::timeout(tool_use_timeout, async {
+                let mut rx = shared_rx.lock().await;
+                rx.recv().await
+            })
+            .await;
+
+            match event {
+                Ok(Some(ref event)) => {
+                    if let StreamEvent::ContentBlockStart {
+                        index,
+                        content_block: ContentBlock::ToolUse { id, .. },
+                        ..
+                    } = event
+                    {
+                        tool_use_ids.push(id.clone());
+                        active_tool_use_block_index = Some(*index);
+                        last_block_was_tool_use = false;
+                    }
+
+                    if let StreamEvent::ContentBlockStop { index } = event {
+                        if active_tool_use_block_index == Some(*index) {
+                            last_block_was_tool_use = true;
+                            active_tool_use_block_index = None;
+                        }
+                    }
+
+                    if let StreamEvent::ContentBlockStart { .. } = event {
+                        last_block_was_tool_use = false;
+                    }
+
+                    let is_tool_use_delta = matches!(
+                        event,
+                        StreamEvent::MessageDelta {
+                            delta: crate::types::claude::MessageDeltaContent {
+                                stop_reason: Some(StopReason::ToolUse),
+                                ..
+                            },
+                            ..
+                        }
+                    );
+
+                    if is_tool_use_delta {
+                        reached_tool_use = true;
+                    }
+
+                    let is_stop = matches!(event, StreamEvent::MessageStop);
+                    events_to_stream.push(event.clone());
+
+                    if reached_tool_use {
+                        let mut rx = shared_rx.lock().await;
+                        while let Ok(event) = rx.try_recv() {
+                            events_to_stream.push(event);
+                        }
+                        break;
+                    }
+
+                    if is_stop {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(_timeout) => {
+                    if last_block_was_tool_use {
+                        reached_tool_use = true;
+                        let mut rx = shared_rx.lock().await;
+                        while let Ok(event) = rx.try_recv() {
+                            events_to_stream.push(event);
+                        }
+                        break;
+                    }
+                    last_block_was_tool_use = false;
+                }
+            }
+        }
+
+        if reached_tool_use && !tool_use_ids.is_empty() {
+            SessionManager::pause(
+                self.clone(),
+                message_start,
+                shared_rx,
+                tool_use_ids,
+            )
+            .await;
+        }
+
+        let events = events_to_stream;
+        let stream = try_stream! {
+            for event in events {
+                yield stream_event_to_sse(event).map_err(|e| axum::Error::new(e))?;
+            }
+        };
+        let stream = stream.map_err(|e: axum::Error| -> BoxError { e.into() });
+        Ok(Sse::new(stream)
+            .keep_alive(Default::default())
+            .into_response())
+    }
+
+    pub async fn resume_after_tool_result(
+        &mut self,
+        tool_use_id: &str,
+        tool_result_content: &str,
+    ) -> Result<axum::response::Response, ClewdrError> {
+        let (resumed_state, message_start, _shared_rx) =
+            SessionManager::resume_by_tool_id(tool_use_id)
+                .await
+                .ok_or(ClewdrError::BadRequest {
+                    msg: "No pending tool call found for this tool_use_id",
+                })?;
+
+        *self = resumed_state;
+
+        let org_uuid = self
+            .org_uuid
+            .to_owned()
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "Organization UUID is not set",
+            })?;
+
+        let conv_uuid = self
+            .conv_uuid
+            .to_owned()
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "Conversation UUID is not set",
+            })?;
+
+        let endpoint = self
+            .endpoint
+            .join(&format!(
+                "api/organizations/{}/chat_conversations/{}/tool_result",
+                org_uuid, conv_uuid
+            ))
+            .map_err(|e| ClewdrError::Whatever {
+                message: format!("Parse URL error: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+
+        let body = serde_json::json!({
+            "tool_use_id": tool_use_id,
+            "content": [{"type": "text", "text": tool_result_content}],
+        });
+
+        let resp = self
+            .build_request(Method::POST, endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to send tool result",
+            })?;
+
+        if !resp.status().is_success() {
+            return resp.check_claude().await.map(|_| {
+                axum::response::Response::new(axum::body::Body::empty())
+            });
+        }
+
+        debug!("Tool result sent, continuing with completion");
+
+        let raw_stream = crate::claude_web_state::sse_manager::wrap_response_stream(resp);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<StreamEvent>();
+
+        tokio::spawn(async move {
+            let tx = event_tx;
+            let mut sse_stream = raw_stream;
+            while let Some(event_result) = sse_stream.next().await {
+                match event_result {
+                    Ok(event) => {
+                        if let Ok(parsed) = serde_json::from_str::<StreamEvent>(&event.data) {
+                            if filter_event(&parsed) {
+                                if tx.send(parsed).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("SSE stream error in resume: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stream = try_stream! {
+            yield stream_event_to_sse(StreamEvent::MessageStart {
+                message: message_start,
+            }).map_err(|e| axum::Error::new(e))?;
+
+            loop {
+                match event_rx.recv().await {
+                    Some(event) => {
+                        let is_done = matches!(&event, StreamEvent::MessageStop);
+                        yield stream_event_to_sse(event).map_err(|e| axum::Error::new(e))?;
+                        if is_done {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        };
+
+        if let Some(conv_uuid) = self.conv_uuid.clone() {
+            SessionManager::complete(&conv_uuid).await;
+        }
+
+        let stream = stream.map_err(|e: axum::Error| -> BoxError { e.into() });
+        Ok(Sse::new(stream)
+            .keep_alive(Default::default())
+            .into_response())
     }
 }
 
@@ -240,24 +537,20 @@ impl ClaudeWebState {
         code.endpoint = self.endpoint.clone();
         code.proxy = self.proxy.clone();
         code.client = self.client.clone();
-        // populate cookie header for Claude code API requests
         if let Some(ref c) = self.cookie
             && let Ok(val) = http::HeaderValue::from_str(&c.cookie.to_string())
         {
             code.set_cookie_header_value(val);
         }
 
-        // OAuth exchange to get access token
         let org = code.get_organization().await.ok()?;
         let exch = code.exchange_code(&org).await.ok()?;
         code.exchange_token(exch).await.ok()?;
         let access = code.cookie.as_ref()?.token.as_ref()?.access_token.clone();
 
-        // prepare body
         let mut body = params.clone();
         body.stream = Some(false);
 
-        // do count_tokens
         bearer_count_tokens(&code, &access, &body).await
     }
 }
@@ -291,6 +584,5 @@ async fn count_code_output_tokens_for_text(
         messages: vec![Message::new_text(Role::Assistant, text)],
         ..Default::default()
     };
-    // do not set count_tokens_allowed flag here to avoid races; handled by try_code_count_tokens
     bearer_count_tokens(&code, &access, &body).await
 }

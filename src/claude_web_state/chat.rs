@@ -42,15 +42,17 @@ impl ClaudeWebState {
             }
             let mut state = self.to_owned();
             let p = p.to_owned();
+            let has_tools = p.tools.as_ref().is_some_and(|t| !t.is_empty());
 
             let cookie = state.request_cookie().await?;
-            // check if request is successful
+            let mut state_for_err = state.clone();
             let web_res = async {
                 state.bootstrap().await?;
-                state.send_chat(p).await
+                let resp = state.send_chat(p).await?;
+                Ok::<_, ClewdrError>((state, resp))
             };
             let transform_res = web_res
-                .and_then(async |r| self.transform_response(r).await)
+                .and_then(async |(mut s, r)| s.transform_response_with_opts(r, has_tools).await)
                 .instrument(info_span!("claude_web", "cookie" = cookie.cookie.mask()));
 
             match transform_res.await {
@@ -59,9 +61,8 @@ impl ClaudeWebState {
                 }
                 Err(e) => {
                     error!("{e}");
-                    // 429 error
                     if let ClewdrError::InvalidCookie { reason } = e {
-                        state.return_cookie(Some(reason.to_owned())).await;
+                        state_for_err.return_cookie(Some(reason.to_owned())).await;
                         continue;
                     }
                     return Err(e);
@@ -200,5 +201,57 @@ impl ClaudeWebState {
             })?
             .check_claude()
             .await
+    }
+
+    pub async fn send_tool_result(
+        &mut self,
+        tool_use_id: &str,
+        tool_result_content: &str,
+    ) -> Result<(), ClewdrError> {
+        let org_uuid = self
+            .org_uuid
+            .to_owned()
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "Organization UUID is not set",
+            })?;
+
+        let conv_uuid = self
+            .conv_uuid
+            .to_owned()
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "Conversation UUID is not set",
+            })?;
+
+        let endpoint = self
+            .endpoint
+            .join(&format!(
+                "api/organizations/{}/chat_conversations/{}/tool_result",
+                org_uuid, conv_uuid
+            ))
+            .map_err(|e| ClewdrError::Whatever {
+                message: format!("Parse URL error: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+
+        let body = json!({
+            "tool_use_id": tool_use_id,
+            "content": [{"type": "text", "text": tool_result_content}],
+        });
+
+        let resp = self
+            .build_request(Method::POST, endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to send tool result",
+            })?;
+
+        if !resp.status().is_success() {
+            return resp.check_claude().await.map(|_| ());
+        }
+
+        debug!("Tool result sent to conversation {}", conv_uuid);
+        Ok(())
     }
 }

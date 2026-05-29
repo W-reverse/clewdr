@@ -11,7 +11,10 @@ use crate::{
     claude_web_state::ClaudeWebState,
     config::CLEWDR_CONFIG,
     types::{
-        claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent, Role},
+        claude::{
+            ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent, Role,
+            ToolChoice,
+        },
         claude_web::request::*,
     },
     utils::{TIME_ZONE, print_out_text},
@@ -22,12 +25,32 @@ impl ClaudeWebState {
         let system = value.system.take();
         let msgs = mem::take(&mut value.messages);
         let system = merge_system(system.unwrap_or_default());
-        let merged = merge_messages(msgs, system)?;
+        let tool_choice = value.tool_choice.take();
+        let user_tools = value.tools.take();
+        let merged = merge_messages(msgs, system, tool_choice.as_ref(), user_tools.as_deref())?;
 
-        let mut tools = vec![];
+        let mut tools: Vec<Tool> = user_tools
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Tool::from_claude_tool)
+            .collect();
+
+        if let Some(ref tc) = tool_choice {
+            match tc {
+                ToolChoice::None => {
+                    tools.clear();
+                }
+                ToolChoice::Tool { name, .. } => {
+                    tools.retain(|t| t.name == *name);
+                }
+                _ => {}
+            }
+        }
+
         if CLEWDR_CONFIG.load().web_search {
             tools.push(Tool::web_search());
         }
+
         Some(WebRequestBody {
             max_tokens_to_sample: value.max_tokens,
             attachments: vec![Attachment::new(merged.paste)],
@@ -127,10 +150,17 @@ struct Merged {
 /// # Arguments
 /// * `msgs` - Vector of messages to merge
 /// * `system` - System instructions to prepend
+/// * `tool_choice` - Optional tool choice configuration (used for forced tool calls)
+/// * `tools` - Optional list of user-defined tools
 ///
 /// # Returns
 /// * `Option<Merged>` - Merged prompt text, images, and additional metadata, or None if merging fails
-fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
+fn merge_messages(
+    msgs: Vec<Message>,
+    system: String,
+    _tool_choice: Option<&ToolChoice>,
+    _tools: Option<&[crate::types::claude::Tool]>,
+) -> Option<Merged> {
     if msgs.is_empty() {
         return None;
     }
@@ -164,7 +194,6 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                         ContentBlock::Image { source, .. } => {
                             match source {
                                 ImageSource::Base64 { .. } => {
-                                    // push image to the list
                                     imgs.push(source);
                                 }
                                 ImageSource::Url { url } => {
@@ -181,11 +210,92 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                             None
                         }
                         ContentBlock::ImageUrl { image_url } => {
-                            // oai image
                             if let Some(source) = ImageSource::from_data_url(&image_url.url) {
                                 imgs.push(source);
                             }
                             None
+                        }
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            let mut xml = format!(
+                                "<antml:function_calls>\n<antml:invoke name=\"{name}\">\n"
+                            );
+                            if let Some(obj) = input.as_object() {
+                                for (key, value) in obj {
+                                    let val_str = match value {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    xml.push_str(&format!(
+                                        "<antml:parameter name=\"{key}\">{val_str}</antml:parameter>\n"
+                                    ));
+                                }
+                            }
+                            xml.push_str("</antml:invoke>\n</antml:function_calls>\n");
+                            Some(xml)
+                        }
+                        ContentBlock::ServerToolUse { name, input, .. } => {
+                            let mut xml = format!(
+                                "<antml:function_calls>\n<antml:invoke name=\"{name}\">\n"
+                            );
+                            if let Some(obj) = input.as_object() {
+                                for (key, value) in obj {
+                                    let val_str = match value {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    xml.push_str(&format!(
+                                        "<antml:parameter name=\"{key}\">{val_str}</antml:parameter>\n"
+                                    ));
+                                }
+                            }
+                            xml.push_str("</antml:invoke>\n</antml:function_calls>\n");
+                            Some(xml)
+                        }
+                        ContentBlock::McpToolUse { name, input, .. } => {
+                            let mut xml = format!(
+                                "<antml:function_calls>\n<antml:invoke name=\"{name}\">\n"
+                            );
+                            if let Some(obj) = input.as_object() {
+                                for (key, value) in obj {
+                                    let val_str = match value {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    xml.push_str(&format!(
+                                        "<antml:parameter name=\"{key}\">{val_str}</antml:parameter>\n"
+                                    ));
+                                }
+                            }
+                            xml.push_str("</antml:invoke>\n</antml:function_calls>\n");
+                            Some(xml)
+                        }
+                        ContentBlock::ToolResult {
+                            content, ..
+                        } => {
+                            let text_content = match content {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            Some(format!("<function_results>\n{text_content}\n</function_results>\n"))
+                        }
+                        ContentBlock::McpToolResult { content, .. } => {
+                            let text_content = match content {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            Some(format!("<function_results>\n{text_content}\n</function_results>\n"))
+                        }
+                        ContentBlock::WebSearchToolResult { content, .. }
+                        | ContentBlock::WebFetchToolResult { content, .. }
+                        | ContentBlock::CodeExecutionToolResult { content, .. }
+                        | ContentBlock::BashCodeExecutionToolResult { content, .. }
+                        | ContentBlock::TextEditorCodeExecutionToolResult { content, .. }
+                        | ContentBlock::ToolSearchToolResult { content, .. } => {
+                            let text_content = match content {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            Some(format!("<function_results>\n{text_content}\n</function_results>\n"))
                         }
                         _ => None,
                     })
